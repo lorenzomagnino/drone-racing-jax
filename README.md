@@ -1,8 +1,8 @@
 # drone-racing-jax
 
-Checkpoint **2/5: open-loop game solver**. Scopes 3–5 (receding-horizon
-controller, learning, full experiment reproduction) are deliberately pending the requested
-checkpoint review. No strategic robustness is included.
+Checkpoint **3/5: receding-horizon controller**. Learning and the full paper
+experiment remain pending. **No training has been run**, and no strategic robustness
+is included.
 
 Source: [Strategizing at Speed](https://github.com/andrejcarlo/ral26_strategizing_at_speed),
 commit `4b3468deb2377197c3fa20549459f1c86c2e2eb1`.
@@ -62,8 +62,19 @@ gradient = jax.grad(lambda c: solve_game(x0, c, track).us[0, 0, 0])(default_cont
 `make_track` and `periodic_spline` construct fixed data on the host using NumPy
 (a JAX dependency). Dynamics, rollout, costs, constraints, and spline evaluation
 are pure JAX and support `jit`, `vmap`, and differentiation. A joint state is `(2,11)`,
-a joint input `(2,4)`, with time on the leading axis of trajectories. There is no CLI
-or Hydra configuration until there is an experiment to run.
+a joint input `(2,4)`, with time on the leading axis of trajectories.
+
+Run the synchronous closed-loop simulation (15-step horizon, dt=0.05, no training):
+
+```sh
+uv run python -m drone_racing_jax.race --steps 100 --seed 42
+```
+
+It saves `trajectory.npz`, `summary.json`, and `trajectory.png` under ignored
+`outputs/race/`. Starts use the original Cartesian uniform ±0.15 m offsets;
+the standalone CLI uses NumPy's seeded generator, not Julia's Mersenne Twister.
+Cross-language checks below instead give both implementations identical initial
+states, so different random-number generators do not affect the comparison.
 
 ## Source correspondence
 
@@ -78,9 +89,14 @@ Paths below are relative to the original repository unless prefixed by a depende
 | `drone_racing_jax/splines.py` | `src/Spline/SplinesWithCachedDerivatives.jl`, DataInterpolations 8.3.1 | natural cubic values with wrapped domain and cached AD rules |
 | `drone_racing_jax/tracks.py` | `src/trajectories.jl`, `src/Spline/spline.jl`, `src/utils.jl`, `src/Server/server_utils.jl` | four default tracks, arc-length fit, tangent approximation, gates, Gaussian contour weights |
 | `drone_racing_jax/solver.py` | dependency `MCPTrajectoryGameSolver/src/solver_setup.jl`, `src/solve.jl` | coupled Nash stationarity and private complementarity, after eliminating linear dynamics |
+| `drone_racing_jax/controller.py` | `src/Server/mcs_sync.jl`, `src/Server/referee.jl`, `src/trajectory_optimizer.jl`; Optim.jl 1.13.3 Brent | independent ego solves, measured-state progress projection/augmentation, role switching, shifted control warm starts |
+| `drone_racing_jax/race.py` | `src/Server/server_utils.jl`, `src/Server/replay_buffer.jl` | seeded standard starts and a fixed-duration synchronous simulation |
+| `scripts/reference_game.jl` | original game/dynamics/spline files | common Julia validation setup shared by both comparisons |
 | `scripts/reference_open_loop.jl` | original game/dynamics/spline files and original MCP solver | isolated Julia validation without ROS/server/learning imports |
+| `scripts/reference_closed_loop.jl` | original progress/augmentation functions and original MCP solver, synchronous loop rules | fixed-duration Julia check using the original unshifted primal warm start |
 | `scripts/setup_reference.jl` | original `Manifest.toml` | reduced Julia environment with pinned direct package versions |
 | `scripts/compare_open_loop.py` | Julia validation output | plan and warmed-timing comparisons |
+| `scripts/compare_closed_loop.py` | Julia closed-loop output | physical trajectory, applied-input, and role-switch comparisons |
 | `tests/` | formulas in the above files | RK4/cost checks, derivative caches, KKT conditions, implicit gradients, horizon indexing, and JAX transformations |
 
 Here `src/` abbreviates `DroneTrajectorySolver.jl/src/`.
@@ -168,6 +184,50 @@ stationary candidate, not a global Nash certificate. Sensitivities are local to
 the selected solution branch and require a nonsingular Jacobian; at active-set
 changes a unique derivative need not exist.
 
+## Receding-horizon controller
+
+At each measurement, `controller_step`:
+
+1. Projects each measured position onto the track using the original bounded Brent
+   search on `previous_progress ± 2.5`, with absolute/relative tolerance `1e-5`.
+   Progress remains unwrapped across laps.
+2. Rebuilds virtual theta and vtheta from the physical `(p,v,a)` measurement.
+   As in Julia, vtheta is the **norm** of the velocity projection onto the tangent,
+   including when the physical velocity points backwards.
+3. Updates the attacker only after an overtake strictly exceeding 0.75 m in progress.
+4. Solves two games, one per ego ordering. The second drone sees reversed player
+   states and the reversed attacker ID. Each drone applies its own first input.
+5. Shifts each full input plan by one step and appends zero for the next warm start.
+   State trajectories are rebuilt from the next measurement; duals restart at zero.
+
+The shift in item 5 is explicitly requested by this port. Julia instead reuses
+unshifted previous primal variables and clears duals. The numerical comparisons
+below retain that original behavior in Julia and the requested shift in JAX.
+
+For an external measured-state stream:
+
+```python
+from drone_racing_jax.controller import initialize_controller, controller_step
+
+memory = initialize_controller(progress, attacker=2, horizon=15)
+step = controller_step(x0[:, :9], memory, default_context(), track)
+assert step.plans.converged.all(), step.plans.residual
+action, memory = step.us, step.controller  # action is (2,4); next call uses a fresh measurement
+```
+
+`controller_step` is JIT-compiled and keeps its state explicitly in a `ControllerState`.
+`run_closed_loop` is a host simulation loop that measures the resulting physical
+state after every dynamics step. It returns physical states `(T+1,2,9)`, the planning
+states `(T,2,11)`, applied inputs, attacker IDs, and per-ego solver diagnostics.
+
+The simulation has no computational delays, measurement noise, low-level tracking
+controller, safety-filter QP, or disqualification/lap-termination logic. It executes
+the requested number of steps rather than claiming a full race tournament. If either
+ego solve fails, `controller_step` returns NaN actions and retains its old state;
+the host loop raises **before** advancing the plant. This explicit failure behavior
+differs from Julia's server fallback to an older plan. No such fallback was needed
+in the validated runs.
+
 ## Findings for the next checkpoints
 
 The source **does not learn racing-cost weights from demonstrations**. It learns
@@ -199,7 +259,7 @@ Upstream reproduction details found during inspection:
   generates data itself and does not read that dataset, so its absence need not block
   training from scratch. Supplied pretrained checkpoints use different filenames.
 - The baseline's warm-start copies previous primals and resets duals without shifting.
-  The requested shifted warm-start in scope 3 will be an explicit change to document.
+  The requested shifted control warm start is implemented in scope 3, as described above.
 
 ## Experiment commands and reproduction status
 
@@ -213,9 +273,13 @@ The original evaluation entry point is, from `reference/` after Julia setup:
 The checked-in `startup.jl` enables LMPG vs MPC on the lemniscate; most tournament
 jobs are commented out. A full-paper tournament therefore requires selecting jobs
 and restoring sample counts, rather than treating current defaults as the full study.
-There is **no JAX closed-loop main experiment yet** at checkpoint 2.
+The JAX simulation command above implements the synchronous MPG controller; it does
+not yet run the full tournament or the learned controller.
 
 The open-loop comparison can be reproduced using Julia 1.11.5:
+
+The local validation binary is `reference/_julia/julia-1.11.5/bin/julia`; use that
+path in place of `julia` below if Julia is not on your PATH.
 
 ```sh
 julia scripts/setup_reference.jl
@@ -231,7 +295,7 @@ in Julia and Python. Generated plans and reports stay in ignored `outputs/`.
 
 | Comparison | Julia run | JAX run | Gap |
 | --- | --- | --- | --- |
-| Closed-loop trajectories | Not run | Not implemented | Unmeasured |
+| Closed-loop trajectories | 100-step seeded run + 10-step overtake | Same initial states | See checkpoint 3 below |
 | Open-loop plans and solve times | Run, 4 cases | Run, 4 cases | See checkpoint 2 results below |
 | Learned network parameters | Not run | Not implemented | Unmeasured |
 
@@ -269,7 +333,7 @@ Newton iterations: [13, 40, 9, 10, 11, 15, 11, 13, 41, 11, 8, 10]
 The suite checks KKT residuals, feasibility, complementarity, original-cost
 stationarity, active and inactive implicit gradients against finite differences,
 initial-state sensitivity, warm starts, failure handling, and seeded `vmap` runs.
-Seeded **closed-loop** tests belong to scope 3 and are not claimed here.
+Checkpoint 3 adds seeded closed-loop and controller tests, reported below.
 
 ```text
 $ make lint
@@ -283,3 +347,49 @@ tests/test_solver.py .............                                       [ 71%]
 tests/test_tracks.py .........                                           [100%]
 ============================= 32 passed in 39.73s ==============================
 ```
+
+### Checkpoint 3 results
+
+```sh
+julia scripts/setup_reference.jl
+julia --project=reference/_parity --threads=4 scripts/reference_closed_loop.jl outputs/reference_closed_loop.json
+uv run python scripts/compare_closed_loop.py
+```
+
+The reference uses the original Julia progress and state-augmentation functions,
+the original game and PATH solver, and the original unshifted primal warm start.
+JAX independently projects/re-augments its measurements and shifts its input plans.
+Both run two ego games per step. No training is involved.
+
+| Case | Steps | Max position gap (m) | Max physical-state component gap | Max input-component gap | Role mismatches | JAX worst KKT residual |
+| --- | --- | --- | --- | --- | --- | --- |
+| Seed 42 starts | 100 | 4.11e-9 | 7.73e-8 | 1.06e-6 | 0 | 9.74e-9 |
+| Overtaking | 10 | 6.12e-10 | 1.47e-8 | 2.93e-7 | 0 | 5.83e-9 |
+
+Both implementations switched roles once in the overtaking case, on the same step.
+The seeded 100-step case had no role switch. Julia's worst KKT residuals were
+`7.64e-7` and `4.39e-7`, respectively. Median warm full-step times (projection and
+both ego solves) were JAX/Julia `49.14/173.75 ms` and `52.87/182.02 ms` on this
+machine. These are synchronous controller checks, not real-time hardware claims.
+
+The standalone NumPy-seed-42 CLI also completed 100 steps with worst residual
+`8.34e-9`. Its generated plot was visually checked. The expanded suite tests
+measurement feedback, unwrapped projection, vtheta augmentation, strict role-switch
+thresholds, plan shifting, both ego orderings, seeded reproducibility, and failure
+handling in addition to the game and solver checks:
+
+```text
+$ make lint
+uv run ruff check .
+All checks passed!
+
+$ make test
+collected 46 items
+tests/test_controller.py ..............                                  [ 30%]
+tests/test_game.py ..........                                            [ 52%]
+tests/test_solver.py .............                                       [ 80%]
+tests/test_tracks.py .........                                           [100%]
+============================= 46 passed in 38.24s ==============================
+```
+
+Learning, long races, asynchronous delays, and the full paper tournament remain unverified.

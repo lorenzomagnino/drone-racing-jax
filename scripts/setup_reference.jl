@@ -9,5 +9,5 @@ Pkg.add(PackageSpec(url="https://github.com/andrejcarlo/ParametricMCPs.jl.git",
     rev="f32f9ceafd92d5bb6cedb90c699b6ca06cdfa4c6"))
 names = ["MCPTrajectoryGameSolver", "TrajectoryGamesBase", "DataInterpolations",
     "Symbolics", "SymbolicUtils", "SymbolicTracingUtils", "BlockArrays", "JSON3",
-    "QuadGK", "ForwardDiff", "StaticArrays", "Rotations", "LazySets", "ChainRulesCore"]
+    "QuadGK", "ForwardDiff", "StaticArrays", "Rotations", "LazySets", "ChainRulesCore", "Optim"]
 Pkg.add([PackageSpec(name=name, version=manifest[name][1]["version"]) for name in names])
