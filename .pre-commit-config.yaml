@@ -1,0 +1,14 @@
+exclude: ^reference/
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: Ruff
+        entry: uv run ruff check
+        language: system
+        types: [python]
+      - id: black
+        name: Black
+        entry: uv run black --check
+        language: system
+        types: [python]
