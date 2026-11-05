@@ -1,7 +1,7 @@
 # drone-racing-jax
 
-Checkpoint **1/5: game and dynamics**. Scopes 2–5 (Nash solver, receding-horizon
-controller, learning, experiment reproduction) are deliberately pending the requested
+Checkpoint **2/5: open-loop game solver**. Scopes 3–5 (receding-horizon
+controller, learning, full experiment reproduction) are deliberately pending the requested
 checkpoint review. No strategic robustness is included.
 
 Source: [Strategizing at Speed](https://github.com/andrejcarlo/ral26_strategizing_at_speed),
@@ -39,7 +39,24 @@ x0 = jnp.zeros((2, 11))
 us = jnp.zeros((15, 2, 4))
 xs = jax.jit(rollout)(x0, us)
 cost = jax.jit(trajectory_cost)(xs, us, default_context(), track)
-print(xs.shape, cost)  # open-loop dynamics demonstration, not a Nash solution
+print(xs.shape, cost)  # open-loop dynamics demonstration
+```
+
+To solve the original open-loop MPG at its standard starting positions:
+
+```python
+from drone_racing_jax.splines import evaluate
+from drone_racing_jax.solver import solve_game
+
+progress = jnp.array([track.length - 1.0, track.length - 2.5])
+x0 = jnp.zeros((2, 11)).at[:, 9].set(progress)
+x0 = x0.at[:, :3].set(jax.vmap(lambda s: evaluate(track.path, s))(progress))
+solution = solve_game(x0, default_context(), track, horizon=15)
+assert solution.converged, solution.residual
+print(solution.us[0], solution.residual)
+
+# Reverse-mode sensitivity of player 1's first jerk to the cost parameters:
+gradient = jax.grad(lambda c: solve_game(x0, c, track).us[0, 0, 0])(default_context())
 ```
 
 `make_track` and `periodic_spline` construct fixed data on the host using NumPy
@@ -60,7 +77,11 @@ Paths below are relative to the original repository unless prefixed by a depende
 | `drone_racing_jax/game.py` | `src/environment.jl`, dependency `MCPTrajectoryGameSolver/src/solver_setup.jl` | world/state slacks, initial-state and transition equalities |
 | `drone_racing_jax/splines.py` | `src/Spline/SplinesWithCachedDerivatives.jl`, DataInterpolations 8.3.1 | natural cubic values with wrapped domain and cached AD rules |
 | `drone_racing_jax/tracks.py` | `src/trajectories.jl`, `src/Spline/spline.jl`, `src/utils.jl`, `src/Server/server_utils.jl` | four default tracks, arc-length fit, tangent approximation, gates, Gaussian contour weights |
-| `tests/` | formulas in the above files | independent RK4 matrix/cost checks, derivative-cache checks, horizon and JAX transformations |
+| `drone_racing_jax/solver.py` | dependency `MCPTrajectoryGameSolver/src/solver_setup.jl`, `src/solve.jl` | coupled Nash stationarity and private complementarity, after eliminating linear dynamics |
+| `scripts/reference_open_loop.jl` | original game/dynamics/spline files and original MCP solver | isolated Julia validation without ROS/server/learning imports |
+| `scripts/setup_reference.jl` | original `Manifest.toml` | reduced Julia environment with pinned direct package versions |
+| `scripts/compare_open_loop.py` | Julia validation output | plan and warmed-timing comparisons |
+| `tests/` | formulas in the above files | RK4/cost checks, derivative caches, KKT conditions, implicit gradients, horizon indexing, and JAX transformations |
 
 Here `src/` abbreviates `DroneTrajectorySolver.jl/src/`.
 
@@ -100,11 +121,52 @@ Here `src/` abbreviates `DroneTrajectorySolver.jl/src/`.
   Only evaluation time is differentiable; spline data are fixed, as in the source.
 - Track construction uses composite 32-point Gauss–Legendre quadrature on 32 panels
   instead of QuadGK. Bisection retains the source's `1e-5` tolerance, 30 segments,
-  and 200 gate-weight samples. Numerical parity against Julia remains unmeasured.
+  and 200 gate-weight samples. At checkpoint 2, 50 lemniscate samples of position,
+  tangent, and contour weight match Julia within `3.9e-14`; other tracks have not
+  yet been checked against Julia.
   NumPy performs this one-time setup; online evaluation is JAX.
 - Only the default jerk model and two-player racing game are ported at this
   checkpoint. Unused alternative dynamics, toy games, and the single-player MPC
-  baseline are outside this checkpoint. No solver library is needed yet.
+  baseline are outside this checkpoint. The solver uses JAX alone.
+
+## Open-loop solver
+
+`solve_game` solves each player's own stationarity equations jointly with
+`min(slack, multiplier)=0`. Linear dynamics and the fixed initial state are
+eliminated exactly, leaving H*8 input variables and (H−1)*28 inequality multipliers.
+This is the original MPG KKT system with equality multipliers eliminated; it is
+not a minimization of the sum of player costs. The returned plan has H states and
+H inputs, retaining Julia's final unused input.
+
+The numerical method is semismooth Newton with backtracking on squared KKT
+residuals. A tiny primal diagonal regularizer and a least-squares safeguard handle
+ill-conditioned steps. These alter the search direction only; success is measured
+against the unregularized original equations. The default infinity-norm tolerance
+is `1e-8`, with at most 100 iterations. `initial_guess=previous.us` supplies an
+optional control warm start. Multipliers initially start at zero.
+
+`Solution` contains `xs`, `us`, `multipliers`, `residual`, `iterations`, and
+`converged`. Always check `converged` before using a plan. Nonconvergence is explicit;
+reverse-mode differentiation of a failed solve produces NaNs. Successful implicit
+gradients use an adjoint solve of the converged complementarity Jacobian, without
+differentiating Newton iterations. Initial states and continuous context entries
+are differentiable. Track data, numerical settings, and the hard velocity bound
+are fixed; the attacker ID is discrete. Higher-order/forward-mode differentiation
+of the solve is not provided.
+
+There is a necessary distinction between preserving Julia's equations and its
+linearization: `_stage_gradient` uses the original cached **first** spline derivatives
+when forming stationarity. Newton and the implicit backward pass differentiate
+the actual polynomial values in those equations. Julia recursively substitutes
+higher derivative caches, which can differ from numerical differentiation.
+The root equations remain the same; the exact numerical linearization makes
+JAX's implicit gradients agree with finite differences of re-solved plans. Tests
+also compare this stationarity assembly against AD of the original cost function.
+
+As in the paper's PATH implementation, first-order KKT conditions establish a
+stationary candidate, not a global Nash certificate. Sensitivities are local to
+the selected solution branch and require a nonsingular Jacobian; at active-set
+changes a unique derivative need not exist.
 
 ## Findings for the next checkpoints
 
@@ -125,9 +187,9 @@ depth. Deployment uses zero relaxation. The README/paper's high-level descriptio
 does not capture all these implementation details; the executable Julia code is
 the behavior to reproduce.
 
-Potential upstream reproduction obstacles found during inspection:
+Upstream reproduction details found during inspection:
 
-- Julia is not currently installed on this machine.
+- Julia 1.11.5 was installed locally under ignored `reference/_julia/` for validation.
 - The root Manifest uses relative paths for both local Julia packages and a Git
   dependency for ParametricMCPs; preserve those when setting up the Julia environment.
 - `trajectory_optimizer.jl` uses `original_domain` and `num_segments` as bare keyword
@@ -151,17 +213,63 @@ The original evaluation entry point is, from `reference/` after Julia setup:
 The checked-in `startup.jl` enables LMPG vs MPC on the lemniscate; most tournament
 jobs are commented out. A full-paper tournament therefore requires selecting jobs
 and restoring sample counts, rather than treating current defaults as the full study.
-There is **no JAX main experiment yet** at checkpoint 1.
+There is **no JAX closed-loop main experiment yet** at checkpoint 2.
+
+The open-loop comparison can be reproduced using Julia 1.11.5:
+
+```sh
+julia scripts/setup_reference.jl
+julia --project=reference/_parity --threads=4 scripts/reference_open_loop.jl outputs/reference_open_loop.json
+uv run python scripts/compare_open_loop.py
+```
+
+The setup script pins direct package versions from the original Manifest, including
+its ParametricMCPs fork. It uses a smaller environment so ROS, visualization, and
+learning packages are not needed for this check. The Julia harness includes the
+original game/dynamics/spline implementations; track construction runs independently
+in Julia and Python. Generated plans and reports stay in ignored `outputs/`.
 
 | Comparison | Julia run | JAX run | Gap |
 | --- | --- | --- | --- |
 | Closed-loop trajectories | Not run | Not implemented | Unmeasured |
-| Nash solve times | Not run | Not implemented | Unmeasured |
+| Open-loop plans and solve times | Run, 4 cases | Run, 4 cases | See checkpoint 2 results below |
 | Learned network parameters | Not run | Not implemented | Unmeasured |
 
-KKT residual, implicit-solver gradient, and seeded closed-loop tests belong to
-scopes 2 and 3 and are not claimed here. Checkpoint checks on macOS, Python 3.12.13,
-JAX 0.12.0.1, CPU, float64:
+### Checkpoint 2 results
+
+Measured on macOS, CPU, float64, Julia 1.11.5 and JAX 0.12.0.1. Times are medians
+of ten warmed solves with zero-input initial guesses, excluding game construction
+and JIT compilation. The first JAX call for each new horizon took about 1.4 s.
+These are local open-loop checks, not the paper's complete race tournament or its
+hardware timing study. Timing varies with the environment and workload.
+
+| Case | H | Max position gap (m) | Max input-component gap | Julia median (ms) | JAX median (ms) | JAX KKT residual |
+| --- | --- | --- | --- | --- | --- | --- |
+| Standard start | 4 | 8.68e-13 | 2.73e-9 | 14.13 | 1.08 | 5.94e-14 |
+| Standard start | 15 | 7.63e-9 | 1.65e-7 | 87.54 | 13.54 | 6.47e-9 |
+| Close interaction | 15 | 2.56e-10 | 2.84e-8 | 96.28 | 22.87 | 7.11e-14 |
+| Moving state | 15 | 5.09e-8 | 1.01e-6 | 92.33 | 92.69 | 7.38e-13 |
+
+All four original PATH runs returned `MCP_Solved`. Their KKT residuals ranged from
+`9.43e-9` to `8.07e-7` with the original default solver tolerance. The maximum
+difference across all state components was `5.19e-7`. Position, tangent, and
+contour-weight differences at 50 independently constructed track samples were
+`2.78e-14`, `2.77e-14`, and `3.82e-14`, respectively.
+
+The moving state is a regression for a stalled plain Newton line search. Its
+least-squares safeguard converges to the same plan as PATH. An additional seed-42
+smoke check sampled 12 moving states (uniform progress on the lemniscate, separation
+0.4–1.5 m in progress, speeds 1.8/2.5 m/s along the tangent, zero acceleration):
+
+```text
+Seed 42 moving-state checks: 12/12 converged; worst KKT residual: 1.7161834835188738e-09
+Newton iterations: [13, 40, 9, 10, 11, 15, 11, 13, 41, 11, 8, 10]
+```
+
+The suite checks KKT residuals, feasibility, complementarity, original-cost
+stationarity, active and inactive implicit gradients against finite differences,
+initial-state sensitivity, warm starts, failure handling, and seeded `vmap` runs.
+Seeded **closed-loop** tests belong to scope 3 and are not claimed here.
 
 ```text
 $ make lint
@@ -169,10 +277,9 @@ uv run ruff check .
 All checks passed!
 
 $ make test
-collected 19 items
-tests/test_game.py ..........                                            [ 52%]
+collected 32 items
+tests/test_game.py ..........                                            [ 31%]
+tests/test_solver.py .............                                       [ 71%]
 tests/test_tracks.py .........                                           [100%]
-============================== 19 passed in 4.56s ==============================
+============================= 32 passed in 39.73s ==============================
 ```
-
-No Julia execution or cross-language numerical agreement is claimed at this checkpoint.

@@ -47,11 +47,17 @@ def stage_cost(x, u, context, track):
     The last context entry enables the original MPCCGB blocking variant (zero for MPG/LMPG).
     """
     theta = x[:, 9]
-    error = x[:, :3] - jax.vmap(evaluate, in_axes=(None, 0))(track.path, theta)
+    goal = jax.vmap(evaluate, in_axes=(None, 0))(track.path, theta)
     tangent = jax.vmap(evaluate, in_axes=(None, 0))(track.tangent, theta)
+    qc = jax.vmap(evaluate, in_axes=(None, 0))(track.contour_weight, theta)
+    return _stage_cost(x, u, context, goal, tangent, qc)
+
+
+def _stage_cost(x, u, context, goal, tangent, qc):
+    """Cost algebra with independent path features; shared with the KKT assembly."""
+    error = x[:, :3] - goal
     lag = jnp.sum(tangent * error, axis=-1, keepdims=True) * tangent
     contour = error - lag
-    qc = jax.vmap(evaluate, in_axes=(None, 0))(track.contour_weight, theta)
     attacker = jnp.array([2 - context[4], context[4] - 1])
     max_velocity = (1 - attacker) * context[8] + attacker * context[9]
     speed_gap = max_velocity**2 - jnp.sum(x[:, 3:6] ** 2, axis=-1)
