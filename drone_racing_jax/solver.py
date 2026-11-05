@@ -80,6 +80,12 @@ def _newton(
     def residual(z):
         return _residual(z, x0, context, track, horizon, dt, max_velocity)
 
+    return _solve_kkt(residual, z, n, tolerance, max_iterations)
+
+
+def _solve_kkt(residual, z, n, tolerance, max_iterations):
+    """Shared damped Newton solve for nominal and strategically robust KKT systems."""
+
     def condition(state):
         z, iteration, moving = state
         error = jnp.max(jnp.abs(residual(z)))

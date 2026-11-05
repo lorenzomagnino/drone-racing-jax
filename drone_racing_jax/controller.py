@@ -1,6 +1,7 @@
 """Synchronous, decentralized MPG with measured-state feedback and shifted warm starts."""
 
 from functools import partial
+from math import isfinite
 from time import perf_counter
 from typing import NamedTuple
 
@@ -8,6 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from drone_racing_jax.game import dynamics
+from drone_racing_jax.robust import RobustSolution, solve_robust_game
 from drone_racing_jax.solver import Solution, solve_game
 from drone_racing_jax.splines import evaluate
 
@@ -22,7 +24,7 @@ class Step(NamedTuple):
     controller: ControllerState
     planning_state: jax.Array
     us: jax.Array
-    plans: Solution
+    plans: Solution | RobustSolution
 
 
 class ClosedLoop(NamedTuple):
@@ -128,17 +130,28 @@ def initialize_controller(progress, attacker=2, horizon=15):
     )
 
 
-@partial(jax.jit, static_argnames=("dt", "max_velocity", "tolerance", "max_iterations"))
+@partial(jax.jit, static_argnames=("dt", "max_velocity", "tolerance", "max_iterations", "radius"))
 def controller_step(
-    measured, state, context, track, dt=0.05, max_velocity=3.0, tolerance=1e-8, max_iterations=100
+    measured,
+    state,
+    context,
+    track,
+    dt=0.05,
+    max_velocity=3.0,
+    tolerance=1e-8,
+    max_iterations=100,
+    radius=0.0,
 ):
     """Re-solve both ego games from measured (2,9) physical states. Check plans.converged.
 
+    A positive fixed radius selects local OL-SRNE candidates; zero retains nominal MPG.
     Failed solves yield NaN actions and retain the previous controller state. The
     host simulation raises before applying any such action.
     """
     if measured.shape != (2, 9):
         raise ValueError("Expected measured physical state shape (2,9)")
+    if not isfinite(radius) or radius < 0:
+        raise ValueError("The ambiguity radius must be nonnegative")
     horizon = state.guesses.shape[1]
     progress = jax.vmap(estimate_progress, in_axes=(0, 0, None))(
         measured[:, :3], state.progress, track
@@ -147,8 +160,9 @@ def controller_step(
     attacker = update_attacker(progress, state.attacker)
     ego_states = jnp.stack((augmented, augmented[::-1]))
     contexts = jnp.stack((context.at[4].set(attacker), context.at[4].set(3 - attacker)))
+    solver = partial(solve_robust_game, radius=radius) if radius > 0 else solve_game
     plans = jax.vmap(
-        lambda x, c, guess: solve_game(
+        lambda x, c, guess: solver(
             x,
             c,
             track,
@@ -170,7 +184,7 @@ def controller_step(
     return Step(next_state, augmented, jnp.where(valid, plans.us[:, 0, 0], jnp.nan), plans)
 
 
-def run_closed_loop(x0, context, track, steps=100, horizon=15, dt=0.05):
+def run_closed_loop(x0, context, track, steps=100, horizon=15, dt=0.05, radius=0.0):
     """Synchronous noiseless point-mass simulation. No training or race termination rules.
 
     x0 is (2,11); theta supplies the initial projection guess, while vtheta is remeasured.
@@ -192,7 +206,7 @@ def run_closed_loop(x0, context, track, steps=100, horizon=15, dt=0.05):
     )
     for index in range(steps):
         start = perf_counter()
-        result = controller_step(measured, state, context, track, dt=dt)
+        result = controller_step(measured, state, context, track, dt=dt, radius=radius)
         result.us.block_until_ready()
         times.append(perf_counter() - start)
         if not bool(jnp.all(result.plans.converged)):

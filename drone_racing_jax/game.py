@@ -62,10 +62,7 @@ def _stage_cost(x, u, context, goal, tangent, qc):
     max_velocity = (1 - attacker) * context[8] + attacker * context[9]
     speed_gap = max_velocity**2 - jnp.sum(x[:, 3:6] ** 2, axis=-1)
     velocity_error = (speed_gap - jnp.abs(speed_gap)) ** 2
-    separation = jnp.sum((x[0, :3] - x[1, :3]) ** 2)
-    collision_error = jnp.where(
-        separation >= context[6] ** 2, 0.0, (jnp.abs(separation) - context[6] ** 2) ** 2
-    )
+    collision_error = collision_penalty(x[0, :3], x[1, :3], context[6])
     return (
         context[0] * jnp.sum(lag**2, axis=-1)
         + (context[1] * qc + context[2]) * jnp.sum(contour**2, axis=-1)
@@ -74,6 +71,12 @@ def _stage_cost(x, u, context, goal, tangent, qc):
         + (attacker * context[5] - (1 - attacker) * context[11]) * collision_error
         - context[10] * x[:, 10]
     )
+
+
+def collision_penalty(first, second, radius):
+    """Original soft collision penalty; leading time/batch dimensions are supported."""
+    separation = jnp.sum((first - second) ** 2, axis=-1)
+    return jnp.where(separation >= radius**2, 0.0, (jnp.abs(separation) - radius**2) ** 2)
 
 
 def trajectory_cost(xs, us, context, track):

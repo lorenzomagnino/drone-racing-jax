@@ -26,12 +26,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--radius",
+        type=float,
+        default=0.0,
+        help="Whole-horizon opponent-input L2 radius (0: nominal)",
+    )
     parser.add_argument("--output", type=Path, default=Path("outputs/race"))
     args = parser.parse_args()
     jax.config.update("jax_enable_x64", True)
     track = make_track()
     result = run_closed_loop(
-        initial_state(track, args.seed), default_context(), track, steps=args.steps
+        initial_state(track, args.seed),
+        default_context(),
+        track,
+        steps=args.steps,
+        radius=args.radius,
     )
     args.output.mkdir(parents=True, exist_ok=True)
     np.savez(args.output / "trajectory.npz", **result._asdict())
@@ -40,6 +50,7 @@ def main():
         seed=args.seed,
         dt=0.05,
         horizon=15,
+        radius=args.radius,
         worst_kkt_residual=float(result.residuals.max()),
         role_switches=int(jnp.sum(result.attackers[1:] != result.attackers[:-1])),
         first_step_seconds=float(result.step_seconds[0]),
@@ -59,7 +70,10 @@ def main():
     ax.plot(path[:, 0], path[:, 1], "k--", linewidth=1, label="Track")
     for player in range(2):
         ax.plot(result.states[:, player, 0], result.states[:, player, 1], label=f"Drone {player+1}")
-    ax.set(xlabel="x (m)", ylabel="y (m)", aspect="equal", title="MPG closed loop, no training")
+    title = (
+        f"SR-MPG, epsilon={args.radius:g}" if args.radius > 0 else "MPG closed loop, no training"
+    )
+    ax.set(xlabel="x (m)", ylabel="y (m)", aspect="equal", title=title)
     ax.legend()
     fig.tight_layout()
     fig.savefig(args.output / "trajectory.png", dpi=160)

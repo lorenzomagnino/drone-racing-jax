@@ -1,8 +1,12 @@
 # drone-racing-jax
 
-Checkpoint **3/5: receding-horizon controller**. Learning and the full paper
-experiment remain pending. **No training has been run**, and no strategic robustness
-is included.
+The nominal port is complete through **checkpoint 3/5: receding-horizon controller**.
+The strategically robust extension is now implemented; see [ROBUSTNESS.md](ROBUSTNESS.md)
+for the definition, numerical limits, experiments, and results. Learning and the full
+paper experiment remain pending. **No training has been run.**
+Current verification: **56 tests pass**; the full output and paired SR results are
+in [ROBUSTNESS.md](ROBUSTNESS.md). The checkpoint outputs below document the earlier
+nominal-port milestones.
 
 Source: [Strategizing at Speed](https://github.com/andrejcarlo/ral26_strategizing_at_speed),
 commit `4b3468deb2377197c3fa20549459f1c86c2e2eb1`.
@@ -70,6 +74,9 @@ Run the synchronous closed-loop simulation (15-step horizon, dt=0.05, no trainin
 uv run python -m drone_racing_jax.race --steps 100 --seed 42
 ```
 
+Add `--radius 5 --output outputs/sr-race` for the strategically robust controller.
+The default radius is zero, retaining the nominal controller.
+
 It saves `trajectory.npz`, `summary.json`, and `trajectory.png` under ignored
 `outputs/race/`. Starts use the original Cartesian uniform ±0.15 m offsets;
 the standalone CLI uses NumPy's seeded generator, not Julia's Mersenne Twister.
@@ -89,6 +96,8 @@ Paths below are relative to the original repository unless prefixed by a depende
 | `drone_racing_jax/splines.py` | `src/Spline/SplinesWithCachedDerivatives.jl`, DataInterpolations 8.3.1 | natural cubic values with wrapped domain and cached AD rules |
 | `drone_racing_jax/tracks.py` | `src/trajectories.jl`, `src/Spline/spline.jl`, `src/utils.jl`, `src/Server/server_utils.jl` | four default tracks, arc-length fit, tangent approximation, gates, Gaussian contour weights |
 | `drone_racing_jax/solver.py` | dependency `MCPTrajectoryGameSolver/src/solver_setup.jl`, `src/solve.jl` | coupled Nash stationarity and private complementarity, after eliminating linear dynamics |
+| `drone_racing_jax/robust.py` | new extension from `../../rhg-paper/chapters/sr-olne.tex`; no Julia SR counterpart | constrained whole-horizon opponent ambiguity and local min–max KKT candidates |
+| `drone_racing_jax/robust_study.py` | new experiment, no Julia counterpart | paired nominal/SR runs with ordinary and feasible adversarial opponents |
 | `drone_racing_jax/controller.py` | `src/Server/mcs_sync.jl`, `src/Server/referee.jl`, `src/trajectory_optimizer.jl`; Optim.jl 1.13.3 Brent | independent ego solves, measured-state progress projection/augmentation, role switching, shifted control warm starts |
 | `drone_racing_jax/race.py` | `src/Server/server_utils.jl`, `src/Server/replay_buffer.jl` | seeded standard starts and a fixed-duration synchronous simulation |
 | `scripts/reference_game.jl` | original game/dynamics/spline files | common Julia validation setup shared by both comparisons |
